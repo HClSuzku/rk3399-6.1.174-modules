@@ -82,13 +82,28 @@ jobs:
         working-directory: kernel
         run: |
           set -eux
+          echo "=== 诊断: make modules 产物是否真的存在 ==="
+          echo "源码树 .ko 总数: $(find . -name '*.ko' | wc -l)"
+          echo "Module.symvers: $([ -f Module.symvers ] && wc -l < Module.symvers || echo 缺失)"
+          echo "modules.order 行数: $([ -f modules.order ] && wc -l < modules.order || echo 缺失)"
+          echo
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
-               INSTALL_MOD_PATH="$PWD/../out" INSTALL_MOD_STRIP=--strip-debug modules_install 2>&1 | tail -n 15
+               INSTALL_MOD_PATH="$PWD/../out" INSTALL_MOD_STRIP=--strip-debug modules_install
           KREL="$(ls ../out/lib/modules | head -1)"
           echo "$KREL" > ../krel.txt
           echo "kernelrelease=$KREL"
-          echo "ko 数量: $(find "../out/lib/modules/$KREL" -name '*.ko' | wc -l)"
+          KOCOUNT="$(find "../out/lib/modules/$KREL" -name '*.ko' | wc -l)"
+          echo "ko 数量: $KOCOUNT"
           echo "modules.dep 行数: $(wc -l < "../out/lib/modules/$KREL/modules.dep")"
+          echo
+          echo "=== 硬闸门: 装出来的 .ko 必须够数，否则判定失败 ==="
+          if [ "$KOCOUNT" -lt 2000 ]; then
+            echo "FAIL: 只装出 $KOCOUNT 个 .ko（预期 >=2000）。out 树实际内容："
+            find ../out -maxdepth 4 | head -40
+            echo "--- out 树 .ko 计数 ---"
+            find ../out -name '*.ko' | wc -l
+            exit 1
+          fi
           echo "--- 抽查 vermagic（必须是 6.1.174 SMP mod_unload aarch64，不能带 preempt）---"
           for m in kernel/fs/overlayfs/overlay.ko kernel/net/ipv6/ipv6.ko kernel/drivers/net/tun.ko; do
             [ -f "../out/lib/modules/$KREL/$m" ] && echo "$m -> $(modinfo -F vermagic "../out/lib/modules/$KREL/$m")"
@@ -96,6 +111,11 @@ jobs:
           echo "--- 架构抽查 ---"
           aarch64-linux-gnu-objdump -f "../out/lib/modules/$KREL/kernel/fs/overlayfs/overlay.ko" | grep -i architecture || true
           cd ../out && tar czf "../modules-$KREL.tar.gz" lib && ls -lh ../modules-*.tar.gz
+          echo "=== 硬闸门: 归档内 .ko 数量复核 ==="
+          TARCOUNT="$(tar -tzf "../modules-$KREL.tar.gz" | grep -c '\.ko$' || true)"
+          echo "归档内 .ko 数量: $TARCOUNT"
+          [ "$TARCOUNT" -ge 2000 ] || { echo "FAIL: 归档内只有 $TARCOUNT 个 .ko"; exit 1; }
+          echo "PACK_ARCHIVE_OK"
 
       - name: 上传模块包
         uses: actions/upload-artifact@v4
