@@ -84,33 +84,54 @@ jobs:
           set -eux
           echo "=== 诊断: make modules 产物是否真的存在 ==="
           echo "源码树 .ko 总数: $(find . -name '*.ko' | wc -l)"
-          echo "Module.symvers: $([ -f Module.symvers ] && wc -l < Module.symvers || echo 缺失)"
           echo "modules.order 行数: $([ -f modules.order ] && wc -l < modules.order || echo 缺失)"
           echo
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
-               INSTALL_MOD_PATH="$PWD/../out" INSTALL_MOD_STRIP=--strip-debug modules_install
-          KREL="$(ls ../out/lib/modules | head -1)"
+          # 不依赖 make modules_install：它在本配置下（CONFIG_MODVERSIONS=n、无 vmlinux
+          # 导出符号、modules-only modpost）会把 .ko 静默漏掉，只留下
+          # source/build/kernel/modules.order 这些占位条目，产出空包却返回成功。
+          # 这里改为按 modules.order 显式铺树 + 自行 depmod，行为确定。
+          KREL="$(make -s ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- kernelrelease)"
           echo "$KREL" > ../krel.txt
           echo "kernelrelease=$KREL"
-          KOCOUNT="$(find "../out/lib/modules/$KREL" -name '*.ko' | wc -l)"
-          echo "ko 数量: $KOCOUNT"
-          echo "modules.dep 行数: $(wc -l < "../out/lib/modules/$KREL/modules.dep")"
+          STAGE="../stage/lib/modules/$KREL"
+          rm -rf ../stage && mkdir -p "$STAGE"
+          COPIED=0; MISSING=0
+          while IFS= read -r ko; do
+            [ -f "$ko" ] || { MISSING=$((MISSING+1)); continue; }
+            mkdir -p "$STAGE/$(dirname "$ko")"
+            cp -a "$ko" "$STAGE/$ko"
+            COPIED=$((COPIED+1))
+          done < modules.order
+          echo "按 modules.order 铺入: $COPIED 个；modules.order 里源树不存在的: $MISSING"
+          echo "暂存树 .ko 计数: $(find "$STAGE" -name '*.ko' | wc -l)"
+          echo
+          echo "=== 去调试段 ==="
+          find "$STAGE" -name '*.ko' -print0 | xargs -0 -r -n 50 aarch64-linux-gnu-strip --strip-debug
+          echo "strip 完成"
+          echo
+          echo "=== depmod ==="
+          depmod -b ../stage "$KREL"
+          echo "modules.dep 行数: $(wc -l < "$STAGE/modules.dep")"
           echo
           echo "=== 硬闸门: 装出来的 .ko 必须够数，否则判定失败 ==="
+          KOCOUNT="$(find "$STAGE" -name '*.ko' | wc -l)"
           if [ "$KOCOUNT" -lt 2000 ]; then
-            echo "FAIL: 只装出 $KOCOUNT 个 .ko（预期 >=2000）。out 树实际内容："
-            find ../out -maxdepth 4 | head -40
-            echo "--- out 树 .ko 计数 ---"
-            find ../out -name '*.ko' | wc -l
+            echo "FAIL: 只铺出 $KOCOUNT 个 .ko（预期 >=2000）"
+            echo "--- 暂存树前 40 条 ---"; find "$STAGE" | head -40
             exit 1
           fi
+          echo "ko 数量: $KOCOUNT"
           echo "--- 抽查 vermagic（必须是 6.1.174 SMP mod_unload aarch64，不能带 preempt）---"
           for m in kernel/fs/overlayfs/overlay.ko kernel/net/ipv6/ipv6.ko kernel/drivers/net/tun.ko; do
-            [ -f "../out/lib/modules/$KREL/$m" ] && echo "$m -> $(modinfo -F vermagic "../out/lib/modules/$KREL/$m")"
+            [ -f "$STAGE/$m" ] && echo "$m -> $(aarch64-linux-gnu-objdump -s -j .modinfo "$STAGE/$m" 2>/dev/null | tr -d '\0' | grep -o '6\.1\.174[^ ]*' | head -1)"
           done
           echo "--- 架构抽查 ---"
-          aarch64-linux-gnu-objdump -f "../out/lib/modules/$KREL/kernel/fs/overlayfs/overlay.ko" | grep -i architecture || true
-          cd ../out && tar czf "../modules-$KREL.tar.gz" lib && ls -lh ../modules-*.tar.gz
+          aarch64-linux-gnu-objdump -f "$STAGE/kernel/fs/overlayfs/overlay.ko" | grep -i architecture || true
+          echo "--- 三个目标模块的依赖链是否在包里 ---"
+          for m in overlay ipv6 tun; do
+            echo "  $m: $(grep -E "/$m\.ko" "$STAGE/modules.dep" | head -1 | cut -c1-200)"
+          done
+          cd ../stage && tar czf "../modules-$KREL.tar.gz" lib && ls -lh "../modules-$KREL.tar.gz"
           echo "=== 硬闸门: 归档内 .ko 数量复核 ==="
           TARCOUNT="$(tar -tzf "../modules-$KREL.tar.gz" | grep -c '\.ko$' || true)"
           echo "归档内 .ko 数量: $TARCOUNT"
