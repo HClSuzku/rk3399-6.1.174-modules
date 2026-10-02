@@ -1,0 +1,120 @@
+name: build-modules-6.1.174
+
+on:
+  workflow_dispatch:
+    inputs:
+      note:
+        description: 备注（可留空）
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # 设备那块 Image 的编译器是 aarch64-linux-gnu-gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3)，
+    # 即 x86_64 + Ubuntu 22.04 交叉编译。这里刻意选 ubuntu-22.04（公开仓库免费 4 核 16G），
+    # 把编译器版本也复现成同一支，尽量消除工具链差异。
+    runs-on: ubuntu-22.04
+    timeout-minutes: 330
+
+    steps:
+      - name: 取本仓库（设备配置 + 闸门脚本）
+        uses: actions/checkout@v4
+        with:
+          path: repo
+
+      - name: 取内核源码（ophub/linux-6.1.y-rockchip 固定 commit）
+        uses: actions/checkout@v4
+        with:
+          repository: ophub/linux-6.1.y-rockchip
+          ref: be74fe08d7c6f60b5fd10e92917cd1eb2fa04210
+          fetch-depth: 1
+          path: kernel
+
+      - name: 记录环境与源码指纹
+        run: |
+          set -x
+          uname -a
+          nproc
+          free -g | head -2
+          gcc --version | head -1
+          cd kernel
+          git log -1 --format='源码 HEAD: %H  %ad  %s' --date=iso
+          git status --short | head -5
+          git rev-parse HEAD > ../src-head.txt
+
+      - name: 安装交叉工具链与构建依赖
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc bison flex libssl-dev libelf-dev \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu kmod rsync
+          aarch64-linux-gnu-gcc --version | head -1
+          aarch64-linux-gnu-ld --version | head -1
+          aarch64-linux-gnu-strip --version | head -1
+
+      - name: 放入设备配置并 olddefconfig
+        working-directory: kernel
+        run: |
+          set -eux
+          cp ../repo/device-config.txt .config
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+          make -s ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- kernelrelease | tee ../kernelrelease.txt
+          cp .config ../generated-config.txt
+
+      - name: 闸门校验（配置差异 + kernelrelease + 关键项）
+        working-directory: kernel
+        run: |
+          set -o pipefail
+          bash ../repo/scripts/check_config.sh ../repo/device-config.txt .config ../kernelrelease.txt 2>&1 | tee ../gate-report.txt
+
+      - name: 编译全部模块
+        working-directory: kernel
+        run: |
+          set -o pipefail
+          date -u +'开始: %F %T UTC'
+          make -j"$(nproc)" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules 2>&1 | tee ../build.log | tail -n 40
+          date -u +'结束: %F %T UTC'
+
+      - name: 安装（去调试段）并打包
+        working-directory: kernel
+        run: |
+          set -eux
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+               INSTALL_MOD_PATH="$PWD/../out" INSTALL_MOD_STRIP=--strip-debug modules_install 2>&1 | tail -n 15
+          KREL="$(ls ../out/lib/modules | head -1)"
+          echo "$KREL" > ../krel.txt
+          echo "kernelrelease=$KREL"
+          echo "ko 数量: $(find "../out/lib/modules/$KREL" -name '*.ko' | wc -l)"
+          echo "modules.dep 行数: $(wc -l < "../out/lib/modules/$KREL/modules.dep")"
+          echo "--- 抽查 vermagic（必须是 6.1.174 SMP mod_unload aarch64，不能带 preempt）---"
+          for m in kernel/fs/overlayfs/overlay.ko kernel/net/ipv6/ipv6.ko kernel/drivers/net/tun.ko; do
+            [ -f "../out/lib/modules/$KREL/$m" ] && echo "$m -> $(modinfo -F vermagic "../out/lib/modules/$KREL/$m")"
+          done
+          echo "--- 架构抽查 ---"
+          aarch64-linux-gnu-objdump -f "../out/lib/modules/$KREL/kernel/fs/overlayfs/overlay.ko" | grep -i architecture || true
+          cd ../out && tar czf "../modules-$KREL.tar.gz" lib && ls -lh ../modules-*.tar.gz
+
+      - name: 上传模块包
+        uses: actions/upload-artifact@v4
+        with:
+          name: modules-6.1.174
+          path: modules-6.1.174.tar.gz
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: 上传诊断材料（无论成败）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-reports
+          path: |
+            gate-report.txt
+            kernelrelease.txt
+            generated-config.txt
+            build.log
+            src-head.txt
+          retention-days: 14
+          if-no-files-found: warn
